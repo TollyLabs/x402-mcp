@@ -1,12 +1,15 @@
 # TOLLY x402 MCP server
 
 [![npm](https://img.shields.io/npm/v/@tollylabs/x402-mcp)](https://www.npmjs.com/package/@tollylabs/x402-mcp)
+[![ci](https://github.com/TollyLabs/x402-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/TollyLabs/x402-mcp/actions/workflows/ci.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 `npx -y @tollylabs/x402-mcp` · [Agent Exchange](https://agent.tollylabs.com/agentic-market/) ·
 MCP Registry: `com.tollylabs/x402-mcp`
 
-This repository holds the public listing of TOLLY's MCP server (README, registry metadata, a
-Dockerfile that runs the published npm package). The package itself is published on npm.
+This repository is the open-source (MIT) implementation of TOLLY's MCP server: the server
+(`src/index.ts`), the x402 buyer client it pays with (`src/sdk.ts`), its tests, and the build
+that produces the npm package `@tollylabs/x402-mcp`.
 
 An MCP server that gives an AI agent TOLLY's paid services on Arc (Circle's chain): market search,
 token intelligence and risk, price candles, wallet balances, trades and LP positions, creator
@@ -96,3 +99,28 @@ Refunds cover a seller that fails (an error, no answer, a broken connection, an 
 
 Routed services are priced on Arc mainnet (`eip155:5042`); with another `TOLLY_X402_NETWORK`
 they can be searched but not bought.
+
+## Build from source
+
+Developing needs Node.js 22.12 or later (the published package runs on Node.js 20 or later).
+
+```bash
+git clone https://github.com/TollyLabs/x402-mcp.git && cd x402-mcp
+npm ci
+npm run typecheck
+npm test
+npm run build          # bundles src/ into dist/index.js
+node dist/index.js     # stdio MCP server; same environment variables as above
+```
+
+To use a local build from an MCP client, point `command` at `node` and `args` at the absolute path
+of `dist/index.js`. Docker (stdio): `docker build -t tolly-x402-mcp .` then
+`docker run -i --rm -e BUYER_PRIVATE_KEY -e TOLLY_X402_NETWORK tolly-x402-mcp`.
+
+Layout: `src/index.ts` (MCP server: tools, spending ledger, routed buys), `src/sdk.ts` (x402
+buyer: discovery, price checks, spending policy, EIP-3009 signing, recovery), `src/usage.ts` (the
+usage sign-in message), `test/` (vitest, no network: local mock servers only).
+
+## License
+
+[MIT](LICENSE)
