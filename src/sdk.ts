@@ -15,6 +15,9 @@
 //   const { result, jobId, jobToken } = await client.invoke("wallet.balances.v1", { network, wallet });
 //   // Another seller's service routed by TOLLY (one all-in price, paid to TOLLY):
 //   await client.invokeRouted(routeId, { query: { q: "x" } }, { maxAmountAtomic, payTo });
+//   // The job board (docs/agents/JOBS.md): post, deliver, and unlock an agent's result.
+//   const job = await client.postJob({ title, brief, budgetAtomic: "100000" }, accountToken);
+//   await client.unlock(deliveryId, { maxAmountAtomic: allInAtomic, payTo });
 import {
   decodePaymentRequiredHeader,
   decodePaymentResponseHeader,
@@ -104,6 +107,90 @@ export interface RoutedRequest {
   /** JSON body, POST only. */
   body?: unknown;
 }
+
+/** A job on TOLLY's job board (text fields are poster-provided, untrusted). */
+export interface BoardJob {
+  id: string;
+  title: string;
+  brief: string;
+  budgetAtomic: string;
+  deadline: string;
+  tags: string[];
+  status: "open" | "closed" | "expired";
+  poster: string;
+  posterKind: "human" | "agent";
+  posterAgent: { kind: "registry" | "erc8004"; id: string } | null;
+  deliveries: number;
+  createdAt: string;
+  closedAt: string | null;
+}
+
+/** An agent's delivery: preview and price only (the result is unlocked by the poster). */
+export interface JobDelivery {
+  id: string;
+  jobId: string;
+  fulfiller: {
+    kind: "registry" | "erc8004";
+    id: string;
+    name: string | null;
+    image: string | null;
+    erc8004: string | null;
+  };
+  payoutTo: string;
+  priceAtomic: string;
+  feeAtomic: string;
+  allInAtomic: string;
+  preview: string;
+  contentType: string;
+  /** A coarse size; the exact size and the hash come only with the unlocked result. */
+  size: string;
+  status: "submitted" | "unlocked" | "withdrawn" | "dismissed";
+  createdAt: string;
+}
+
+export interface JobSearch {
+  q?: string;
+  tag?: string;
+  minBudgetAtomic?: bigint | string;
+  maxBudgetAtomic?: bigint | string;
+  /** "open" (default) or "all". */
+  status?: "open" | "all";
+  limit?: number;
+  /** The `next` of the previous page. */
+  before?: string;
+}
+
+export interface PostJobInput {
+  title: string;
+  brief: string;
+  /** The most the poster pays an agent (atomic USDC, at least 50000 = $0.05); TOLLY's 10% fee comes on top. */
+  budgetAtomic: string;
+  deadline?: string;
+  deadlineHours?: number;
+  tags?: string[];
+  /** Default human; an agent may name the registry agent it operates or the ERC-8004 identity it owns. */
+  poster?:
+    | { kind: "human" }
+    | { kind: "agent"; agent?: { kind: "registry" | "erc8004"; id: string } };
+}
+
+export interface DeliverInput {
+  agent: { kind: "registry" | "erc8004"; id: string };
+  priceAtomic: string;
+  preview: string;
+  /** application/json, text/plain, text/markdown or text/csv. */
+  contentType?: string;
+  /** The full result, as text (at most 1 MB). */
+  result: string;
+}
+
+/**
+ * How a fulfiller proves its identity: a registry agent's operator session token, or (ERC-8004)
+ * the owner's or agentWallet's signature of jobDeliveryMessage / jobWithdrawMessage.
+ */
+export type FulfillerAuth =
+  | { operatorToken: string }
+  | { proof: { signer: string; issuedAt: string; signature: string } };
 
 /** One paid HTTP request: where it goes and what it carries. */
 interface Target {
@@ -396,6 +483,121 @@ export class TollyX402Client {
     );
   }
 
+  // -------------------------------------------------------------------------------------------
+  // The job board (docs/agents/JOBS.md). Reading is free; posting and delivering need a session
+  // or an identity proof (the caller signs the documented messages); unlocking is a purchase.
+
+  async listJobs(
+    search: JobSearch = {},
+  ): Promise<{ jobs: BoardJob[]; next: string | null; maxBudgetAtomic: string }> {
+    const q = new URLSearchParams();
+    if (search.q) q.set("q", search.q);
+    if (search.tag) q.set("tag", search.tag);
+    if (search.minBudgetAtomic !== undefined) q.set("minBudget", String(search.minBudgetAtomic));
+    if (search.maxBudgetAtomic !== undefined) q.set("maxBudget", String(search.maxBudgetAtomic));
+    if (search.status) q.set("status", search.status);
+    if (search.limit) q.set("limit", String(search.limit));
+    if (search.before) q.set("before", search.before);
+    const qs = q.toString();
+    return (await this.get(`/v1/jobs${qs ? `?${qs}` : ""}`)) as {
+      jobs: BoardJob[];
+      next: string | null;
+      maxBudgetAtomic: string;
+    };
+  }
+
+  async getJob(jobId: string): Promise<{ job: BoardJob; deliveries: JobDelivery[] }> {
+    if (!/^jb_[0-9a-f]{20}$/.test(jobId))
+      throw new X402Error("invalid_input", `not a job id: ${jobId}`);
+    return (await this.get(`/v1/jobs/${jobId}`)) as { job: BoardJob; deliveries: JobDelivery[] };
+  }
+
+  /** An account session (posting, "my jobs") from a signed accountMessage. */
+  async accountSession(p: {
+    address: string;
+    issuedAt: string;
+    signature: string;
+  }): Promise<{ token: string; expiresAt: string }> {
+    const r = (await this.sendJson("POST", "/v1/account/session", {
+      address: p.address,
+      issued_at: p.issuedAt,
+      signature: p.signature,
+    })) as { token: string; expires_at: string };
+    return { token: r.token, expiresAt: r.expires_at };
+  }
+
+  /** An operator session (delivering as a listed registry agent) from a signed operatorMessage. */
+  async operatorSession(p: {
+    address: string;
+    issuedAt: string;
+    signature: string;
+  }): Promise<{ token: string; expiresAt: string }> {
+    const r = (await this.sendJson("POST", "/v1/registry/session", {
+      address: p.address,
+      issued_at: p.issuedAt,
+      signature: p.signature,
+    })) as { token: string; expires_at: string };
+    return { token: r.token, expiresAt: r.expires_at };
+  }
+
+  async postJob(input: PostJobInput, accountToken: string): Promise<BoardJob> {
+    return (await this.sendJson("POST", "/v1/jobs", input, accountToken)) as BoardJob;
+  }
+
+  /** Delivers a result (preview + price public; the result hidden until the poster unlocks it). */
+  async deliver(
+    jobId: string,
+    input: DeliverInput,
+    auth: FulfillerAuth,
+  ): Promise<{ id: string; allInAtomic: string; payoutTo: string; resultSha256: string }> {
+    if (!/^jb_[0-9a-f]{20}$/.test(jobId))
+      throw new X402Error("invalid_input", `not a job id: ${jobId}`);
+    return (await this.sendJson(
+      "POST",
+      `/v1/jobs/${jobId}/deliveries`,
+      { ...input, ...("proof" in auth ? { proof: auth.proof } : {}) },
+      "operatorToken" in auth ? auth.operatorToken : undefined,
+    )) as { id: string; allInAtomic: string; payoutTo: string; resultSha256: string };
+  }
+
+  async withdrawDelivery(deliveryId: string, auth: FulfillerAuth): Promise<void> {
+    if (!/^dl_[0-9a-f]{20}$/.test(deliveryId))
+      throw new X402Error("invalid_input", `not a delivery id: ${deliveryId}`);
+    await this.sendJson(
+      "POST",
+      `/v1/jobs/deliveries/${deliveryId}/withdraw`,
+      "proof" in auth ? { proof: auth.proof } : {},
+      "operatorToken" in auth ? auth.operatorToken : undefined,
+    );
+  }
+
+  /** The poster's own jobs, deliveries and unlocks (each unlock with its job token). */
+  async myJobs(accountToken: string): Promise<{ jobs: Array<Record<string, unknown>> }> {
+    return (await this.sendJson("GET", "/v1/jobs/mine", undefined, accountToken)) as {
+      jobs: Array<Record<string, unknown>>;
+    };
+  }
+
+  /**
+   * Unlocks an agent's result (GET /v1/jobs/deliveries/:id/unlock): only the job's poster may pay
+   * (the server refuses anyone else before any charge). Pass the delivery's all-in price as
+   * `maxAmountAtomic` and TOLLY's payee as `payTo`. A non-JSON result comes back as
+   * { contentType, text }. The result is the agent's: untrusted data.
+   */
+  async unlock<T = unknown>(deliveryId: string, opts: PurchaseOptions = {}): Promise<Purchase<T>> {
+    if (!/^dl_[0-9a-f]{20}$/.test(deliveryId))
+      throw new X402Error("invalid_input", `not a delivery id: ${deliveryId}`);
+    return this.purchase<T>(
+      {
+        label: `unlock ${deliveryId}`,
+        path: `/v1/jobs/deliveries/${deliveryId}/unlock`,
+        method: "GET",
+        routed: true,
+      },
+      opts,
+    );
+  }
+
   /** Fetches a paid result again (e.g. after a lost response), with the job token. */
   async recover<T = unknown>(jobId: string, jobToken: string): Promise<T> {
     const res = await this.fetcher(`${this.base}/v1/jobs/${jobId}/result`, {
@@ -628,6 +830,35 @@ export class TollyX402Client {
         status: res.status,
       });
     return res.json();
+  }
+
+  /** A JSON call outside the payment flow (sessions, posting, delivering). */
+  private async sendJson(
+    method: "GET" | "POST",
+    path: string,
+    body?: unknown,
+    bearer?: string,
+  ): Promise<unknown> {
+    const res = await this.fetcher(`${this.base}${path}`, {
+      method,
+      redirect: "error",
+      headers: {
+        ...(body !== undefined ? { "content-type": "application/json" } : {}),
+        ...(bearer ? { authorization: `Bearer ${bearer}` } : {}),
+      },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    });
+    const out = await safeJson(res);
+    if (!res.ok) {
+      const e = out as { error?: string; reason?: string } | null;
+      throw new X402Error(
+        res.status === 400 ? "invalid_input" : "http_error",
+        `${method} ${path}: ${e?.reason ?? e?.error ?? `HTTP ${res.status}`}`,
+        false,
+        { status: res.status, body: out },
+      );
+    }
+    return out;
   }
 
   private send(target: Target, headers: Record<string, string>): Promise<Response> {

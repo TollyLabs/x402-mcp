@@ -2,18 +2,18 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "com.tollylabs/x402-mcp",
   "title": "TOLLY x402: paid agent services on Arc",
-  "description": "Pay-per-call agent services in USDC on Arc via x402: TOLLY data plus routed third-party agents.",
+  "description": "Pay-per-call agent services and a job board in USDC on Arc via x402, plus routed agents.",
   "repository": {
     "url": "https://github.com/TollyLabs/x402-mcp",
     "source": "github"
   },
   "websiteUrl": "https://agent.tollylabs.com/agentic-market/",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@tollylabs/x402-mcp",
-      "version": "0.4.2",
+      "version": "0.5.0",
       "transport": {
         "type": "stdio"
       },

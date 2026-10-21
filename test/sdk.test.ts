@@ -262,3 +262,77 @@ describe("routed purchases (invokeRouted)", () => {
     expect(s.seen.filter((x) => x.signed)).toHaveLength(1);
   });
 });
+
+describe("job board (listJobs, deliver, unlock)", () => {
+  const JOB = "jb_00000000000000000001";
+  const DL = "dl_00000000000000000001";
+  function board(paid: () => Response, offer = required()) {
+    const seen: { method: string; url: string; body: string | null; auth: string | null }[] = [];
+    const fetcher = (async (url: RequestInfo | URL, init?: RequestInit) => {
+      const h = new Headers(init?.headers);
+      seen.push({
+        method: init?.method ?? "GET",
+        url: String(url),
+        body: (init?.body as string | undefined) ?? null,
+        auth: h.get("authorization"),
+      });
+      if (String(url).includes("/unlock")) return h.get("PAYMENT-SIGNATURE") ? paid() : r402(offer);
+      if (String(url).endsWith("/deliveries"))
+        return Response.json({ id: DL, allInAtomic: "33000", payoutTo: OTHER }, { status: 201 });
+      if (String(url).endsWith("/v1/jobs") && init?.method === "POST")
+        return Response.json({ error: "invalid", reason: "title is required" }, { status: 400 });
+      return Response.json({ jobs: [], next: null, maxBudgetAtomic: "1000000" });
+    }) as typeof fetch;
+    return { fetcher, seen };
+  }
+
+  it("lists with filters, delivers with the identity proof, and refuses bad ids locally", async () => {
+    const s = board(() => Response.json({}));
+    const c = client(s.fetcher);
+    await c.listJobs({ q: "pools", tag: "arc", maxBudgetAtomic: 50_000n, limit: 5 });
+    expect(s.seen[0]?.url).toBe(`${BASE}/v1/jobs?q=pools&tag=arc&maxBudget=50000&limit=5`);
+    const proof = { signer: account.address, issuedAt: "2026-10-21T00:00:00Z", signature: "0x01" };
+    const d = await c.deliver(
+      JOB,
+      { agent: { kind: "erc8004", id: "77" }, priceAtomic: "30000", preview: "p", result: "r" },
+      { proof },
+    );
+    expect(d.id).toBe(DL);
+    expect(JSON.parse(s.seen[1]?.body ?? "{}")).toMatchObject({ proof, priceAtomic: "30000" });
+    await c.deliver(
+      JOB,
+      { agent: { kind: "registry", id: "a" }, priceAtomic: "1000", preview: "p", result: "r" },
+      { operatorToken: "op" },
+    );
+    expect(s.seen[2]?.auth).toBe("Bearer op");
+    const bad = (await c
+      .postJob({ title: "", brief: "", budgetAtomic: "1" }, "acct")
+      .catch((e) => e)) as X402Error;
+    expect(bad).toMatchObject({ code: "invalid_input", charged: false });
+    await expect(c.unlock("../x")).rejects.toThrow(/delivery id/);
+    await expect(c.getJob("x")).rejects.toThrow(/job id/);
+  });
+
+  it("unlocks with a GET, within the ceiling and payee; a refusal before any charge is final", async () => {
+    const s = board(
+      () =>
+        new Response("a,b", {
+          status: 200,
+          headers: { "content-type": "text/csv; charset=utf-8" },
+        }),
+    );
+    const c = client(s.fetcher);
+    const p = await c.unlock(DL, { maxAmountAtomic: 20_000n, payTo: PAY_TO });
+    expect(p.result).toEqual({ contentType: "text/csv; charset=utf-8", text: "a,b" });
+    expect(s.seen.map((x) => x.method)).toEqual(["GET", "GET"]);
+    const above = (await c.unlock(DL, { maxAmountAtomic: 19_999n }).catch((e) => e)) as X402Error;
+    expect(above.code).toBe("policy_rejected");
+    const refused = board(
+      () => new Response(JSON.stringify({ error: "not_poster", charged: false }), { status: 403 }),
+    );
+    const err = (await client(refused.fetcher)
+      .unlock(DL)
+      .catch((e) => e)) as X402Error;
+    expect(err).toMatchObject({ charged: false, message: "not_poster" });
+  });
+});
