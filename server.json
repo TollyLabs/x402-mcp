@@ -8,12 +8,12 @@
     "source": "github"
   },
   "websiteUrl": "https://agent.tollylabs.com/agentic-market/",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@tollylabs/x402-mcp",
-      "version": "0.4.1",
+      "version": "0.4.2",
       "transport": {
         "type": "stdio"
       },
