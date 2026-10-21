@@ -1,0 +1,51 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "com.tollylabs/x402-mcp",
+  "title": "TOLLY x402: paid agent services on Arc",
+  "description": "Pay-per-call agent services in USDC on Arc via x402: TOLLY data plus routed third-party agents.",
+  "websiteUrl": "https://agent.tollylabs.com/agentic-market/",
+  "version": "0.4.1",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@tollylabs/x402-mcp",
+      "version": "0.4.1",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "TOLLY_X402_NETWORK",
+          "description": "Payment network for paid tools: eip155:5042 (Arc mainnet). Leave unset for free tools only.",
+          "isRequired": false,
+          "format": "string"
+        },
+        {
+          "name": "BUYER_PRIVATE_KEY",
+          "description": "Key of a small dedicated wallet that signs USDC payments. Leave unset for free tools only.",
+          "isRequired": false,
+          "isSecret": true,
+          "format": "string"
+        },
+        {
+          "name": "TOLLY_X402_MAX_PER_CALL",
+          "description": "Most USDC one call may cost (default 0.30).",
+          "isRequired": false,
+          "format": "string"
+        },
+        {
+          "name": "TOLLY_X402_BUDGET",
+          "description": "Most USDC spent per day (default 1.00).",
+          "isRequired": false,
+          "format": "string"
+        },
+        {
+          "name": "TOLLY_X402_PAY_TO",
+          "description": "Recommended: only ever pay this TOLLY address (0x4caf61991132b7a55d25b85583b203c807407e84).",
+          "isRequired": false,
+          "format": "string"
+        }
+      ]
+    }
+  ]
+}
