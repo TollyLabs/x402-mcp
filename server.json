@@ -3,6 +3,10 @@
   "name": "com.tollylabs/x402-mcp",
   "title": "TOLLY x402: paid agent services on Arc",
   "description": "Pay-per-call agent services in USDC on Arc via x402: TOLLY data plus routed third-party agents.",
+  "repository": {
+    "url": "https://github.com/TollyLabs/x402-mcp",
+    "source": "github"
+  },
   "websiteUrl": "https://agent.tollylabs.com/agentic-market/",
   "version": "0.4.1",
   "packages": [
