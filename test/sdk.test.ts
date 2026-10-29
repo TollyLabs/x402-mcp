@@ -5,7 +5,7 @@ import type { PaymentRequired } from "@x402/core/types";
 import { declarePaymentIdentifierExtension } from "@x402/extensions/payment-identifier";
 import { privateKeyToAccount } from "viem/accounts";
 import { describe, expect, it } from "vitest";
-import { TollyX402Client, X402Error } from "../src/sdk.ts";
+import { quoteBoundNonce, TollyX402Client, X402Error } from "../src/sdk.ts";
 
 const BASE = "https://agent.example";
 const PAY_TO = "0x00000000000000000000000000000000000000aa";
@@ -334,5 +334,50 @@ describe("job board (listJobs, deliver, unlock)", () => {
       .unlock(DL)
       .catch((e) => e)) as X402Error;
     expect(err).toMatchObject({ charged: false, message: "not_poster" });
+  });
+});
+
+describe("quote-bound nonces", () => {
+  const bound = (fetcher: typeof fetch) =>
+    new TollyX402Client({
+      baseUrl: BASE,
+      signer: account,
+      fetch: fetcher,
+      policy: { network: "eip155:5042002", maxPerCallAtomic: 50_000n, budgetAtomic: 100_000n },
+      authorizationNonce: (o) => quoteBoundNonce(String(o.extra?.quote)),
+    });
+
+  it("quoteBoundNonce is keccak256 of a fixed label and the quote token", () => {
+    expect(quoteBoundNonce("q")).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(quoteBoundNonce("q")).toBe(quoteBoundNonce("q"));
+    expect(quoteBoundNonce("q")).not.toBe(quoteBoundNonce("r"));
+  });
+
+  it("signs the nonce of each quote, and reports the nonce TOLLY recorded", async () => {
+    const recorded = `0x${"AB".repeat(32)}`;
+    let n = 0;
+    const s = server(() =>
+      ++n === 1
+        ? r402(required({ extra: { name: "USDC", version: "2", quote: "q2" } }), "quote_expired")
+        : new Response(JSON.stringify({ ok: 1 }), {
+            status: 200,
+            headers: { "X-Payment-Nonce": recorded },
+          }),
+    );
+    const p = await bound(s.fetcher).invoke("s.v1", { x: 1 });
+    expect(s.signatures.map(nonceOf)).toEqual([quoteBoundNonce("q"), quoteBoundNonce("q2")]);
+    expect(p.authorizationNonce).toBe(recorded.toLowerCase());
+  });
+
+  it("without the option the nonce is random; a malformed X-Payment-Nonce reads as null", async () => {
+    const s = server(() =>
+      new Response(JSON.stringify({ ok: 1 }), {
+        status: 200,
+        headers: { "X-Payment-Nonce": "0x12" },
+      }),
+    );
+    const p = await client(s.fetcher).invoke("s.v1", { x: 1 });
+    expect(nonceOf(s.signatures[0] as string)).not.toBe(quoteBoundNonce("q"));
+    expect(p.authorizationNonce).toBeNull();
   });
 });

@@ -1,19 +1,19 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "com.tollylabs/x402-mcp",
-  "title": "TOLLY x402: paid agent services on Arc",
-  "description": "Pay-per-call agent services and a job board in USDC on Arc via x402, plus routed agents.",
+  "title": "TOLLY x402: paid agent services and jobs on Arc",
+  "description": "Pay-per-call agent services, a job board and escrowed jobs in USDC on Arc via x402.",
   "repository": {
     "url": "https://github.com/TollyLabs/x402-mcp",
     "source": "github"
   },
   "websiteUrl": "https://agent.tollylabs.com/agentic-market/",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@tollylabs/x402-mcp",
-      "version": "0.5.1",
+      "version": "0.6.0",
       "transport": {
         "type": "stdio"
       },
@@ -47,6 +47,67 @@
           "name": "TOLLY_X402_PAY_TO",
           "description": "Recommended: only ever pay this TOLLY address (0x4caf61991132b7a55d25b85583b203c807407e84).",
           "isRequired": false,
+          "format": "string"
+        },
+        {
+          "name": "TOLLY_ACP_ADDRESS",
+          "description": "Escrowed jobs (Tolly ACP): pin TOLLY's contract, 0x75db32f542f981ca4E545A5B35379e3735104a65 on Arc mainnet. Needed for the ACP wallet tools.",
+          "isRequired": false,
+          "format": "string"
+        },
+        {
+          "name": "TOLLY_ACP_RPC_URL",
+          "description": "Arc RPC (https) the ACP wallet tools send their transactions through, e.g. https://arc.drpc.org.",
+          "isRequired": false,
+          "format": "string"
+        },
+        {
+          "name": "TOLLY_AGENT_WALLET",
+          "description": "Optional: the agent's ERC-6551 wallet whose owner gave this key a USDC allowance (the float).",
+          "isRequired": false,
+          "format": "string"
+        },
+        {
+          "name": "TOLLY_RPC_URL",
+          "description": "Arc RPC (https) for the agent wallet's float and spending-policy transactions. Required with TOLLY_AGENT_WALLET.",
+          "isRequired": false,
+          "format": "string"
+        },
+        {
+          "name": "TOLLY_FLOAT_TARGET_USD",
+          "description": "Float: pull up to this balance on the key (default 1.00).",
+          "isRequired": false,
+          "format": "string"
+        },
+        {
+          "name": "TOLLY_FLOAT_MIN_USD",
+          "description": "Float: pull when the key holds less than this (default 0.25).",
+          "isRequired": false,
+          "format": "string"
+        },
+        {
+          "name": "TOLLY_FLOAT_RESERVE_USD",
+          "description": "Float: gas reserve never spent or returned (default 0.05).",
+          "isRequired": false,
+          "format": "string"
+        },
+        {
+          "name": "TOLLY_SPEND_POLICY",
+          "description": "Optional: AgentSpendPolicy address to pay from the agent's wallet within on-chain rules. Not yet enabled on TOLLY.",
+          "isRequired": false,
+          "format": "string"
+        },
+        {
+          "name": "TOLLY_SPEND_POLICY_CODEHASH",
+          "description": "Optional: keccak256 of the spend policy's runtime code, checked before any transaction.",
+          "isRequired": false,
+          "format": "string"
+        },
+        {
+          "name": "TOLLY_COMPUTE_API_KEY",
+          "description": "Optional: Tolly Compute API key (tck_...) for tolly_compute_chat. Compute tools appear once TOLLY enables compute.",
+          "isRequired": false,
+          "isSecret": true,
           "format": "string"
         }
       ]

@@ -1,8 +1,8 @@
 {
   "name": "@tollylabs/x402-mcp",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "mcpName": "com.tollylabs/x402-mcp",
-  "description": "MCP server for TOLLY's paid agent services on Arc: market data, token and wallet intelligence, quotes and launch preparation, paid per call in USDC over x402; plus other sellers' x402 services routed by TOLLY.",
+  "description": "MCP server for TOLLY's paid agent services on Arc: market data, token and wallet intelligence, quotes and launch preparation, paid per call in USDC over x402; other sellers' x402 services routed by TOLLY, a job board, escrowed jobs (Tolly ACP) and agent-wallet spending limits.",
   "type": "module",
   "bin": {
     "tolly-x402-mcp": "dist/index.js"
@@ -41,6 +41,8 @@
     "arc",
     "crypto",
     "market-data",
+    "erc-8183",
+    "escrow",
     "tolly"
   ],
   "dependencies": {

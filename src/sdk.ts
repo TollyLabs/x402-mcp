@@ -30,6 +30,7 @@ import {
 } from "@x402/extensions/payment-identifier";
 import { Ajv2020, type ValidateFunction } from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
+import { keccak256, stringToBytes } from "viem";
 
 /** Arc USDC through its ERC-20 interface (6 decimals), on mainnet and testnet. */
 export const ARC_USDC = "0x3600000000000000000000000000000000000000";
@@ -86,6 +87,15 @@ export interface ServiceInfo {
   [k: string]: unknown;
 }
 
+export interface ComputeBalance {
+  address: string;
+  network: string;
+  balanceAtomic: bigint;
+  reservedAtomic: bigint;
+  /** What new inference calls may still reserve. */
+  availableAtomic: bigint;
+}
+
 export interface Purchase<T> {
   result: T;
   jobId: string;
@@ -96,6 +106,13 @@ export interface Purchase<T> {
   amountAtomic: string;
   /** The logical operation id; pass it to invoke() again to resume without paying twice. */
   paymentId: string;
+  /**
+   * The EIP-3009 nonce of the authorization TOLLY recorded for this job (the one that pays it),
+   * or null from a gateway that does not say. After a resume (same paymentId) it can differ from
+   * the nonce this invoke signed: that newer authorization is never settled by TOLLY, and a
+   * payer whose authorizations are public (preauthorized) should withdraw it.
+   */
+  authorizationNonce: string | null;
 }
 
 /** What a routed purchase forwards to the seller: the method, a query string and a JSON body. */
@@ -258,6 +275,25 @@ export interface ClientOptions {
    * generates code, and the server validates for free before asking for payment anyway.
    */
   validateLocally?: boolean;
+  /**
+   * The EIP-3009 nonce to sign for an offer. Default: one random nonce per invoke, reused on
+   * every re-sign. A payer whose signature is public before it reaches the seller (an agent
+   * wallet paying through AgentSpendPolicy, whose contract signature is a constant) passes
+   * `quoteBoundNonce` for TOLLY offers, so the payment cannot be presented with anyone else's
+   * quote. Such a signer must itself withdraw the earlier authorization before a re-sign: one
+   * invoke then signs a different nonce per quote.
+   */
+  authorizationNonce?: (offer: PaymentRequirements) => `0x${string}`;
+}
+
+/**
+ * The nonce that ties an x402 authorization to one TOLLY quote: keccak256 of a fixed label and
+ * the quote token from the offer's `extra.quote`. The quote token never appears on chain, so a
+ * third party who sees the authorization cannot present it with a quote of their own. TOLLY
+ * requires it for contract signatures in the Tokenbound form (v = 0), e.g. AgentSpendPolicy.
+ */
+export function quoteBoundNonce(quoteToken: string): `0x${string}` {
+  return keccak256(stringToBytes(`tolly-x402/quote-nonce/v1:${quoteToken}`));
 }
 
 const AUTHORIZATION_TYPES = {
@@ -416,7 +452,8 @@ export class TollyX402Client {
     // on one client cannot both pass the budget.
     this.committed += amount;
 
-    let header = await this.sign(required, offer, paymentId, nonce);
+    const nonceFor = (o: PaymentRequirements) => this.opts.authorizationNonce?.(o) ?? nonce;
+    let header = await this.sign(required, offer, paymentId, nonceFor(offer));
     let lastError: unknown;
     for (let attempt = 1; attempt <= this.policy.maxAttempts && Date.now() < deadline; attempt++) {
       let res: Response;
@@ -447,7 +484,7 @@ export class TollyX402Client {
           );
         }
         offer = fresh;
-        header = await this.sign(required, offer, paymentId, nonce);
+        header = await this.sign(required, offer, paymentId, nonceFor(offer));
         continue;
       }
       if (res.status === 429 && body?.charged === false) {
@@ -524,6 +561,139 @@ export class TollyX402Client {
       signature: p.signature,
     })) as { token: string; expires_at: string };
     return { token: r.token, expiresAt: r.expires_at };
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // Tolly Compute (docs/os/COMPUTE.md): prepaid inference credit for this wallet.
+
+  /** A compute session (manage keys, read credit) from a signed computeMessage (valid 1 h). */
+  async computeSession(p: {
+    address: string;
+    issuedAt: string;
+    signature: string;
+  }): Promise<{ token: string; expiresAt: string }> {
+    const r = (await this.sendJson("POST", "/v1/compute/session", {
+      address: p.address,
+      issued_at: p.issuedAt,
+      signature: p.signature,
+    })) as { token: string; expires_at: string };
+    return { token: r.token, expiresAt: r.expires_at };
+  }
+
+  /**
+   * A new compute API key with the owner's caps (atomic USDC). The secret is returned once; the
+   * server keeps only its hash.
+   */
+  async createComputeKey(
+    sessionToken: string,
+    p: { name: string; maxPerRequestAtomic: bigint; maxPerDayAtomic: bigint },
+  ): Promise<{ id: string; key: string; prefix: string }> {
+    return (await this.sendJson(
+      "POST",
+      "/v1/compute/keys",
+      {
+        name: p.name,
+        max_per_request_atomic: p.maxPerRequestAtomic.toString(),
+        max_per_day_atomic: p.maxPerDayAtomic.toString(),
+      },
+      sessionToken,
+    )) as { id: string; key: string; prefix: string };
+  }
+
+  async revokeComputeKey(sessionToken: string, keyId: string): Promise<void> {
+    await this.sendJson(
+      "POST",
+      `/v1/compute/keys/${encodeURIComponent(keyId)}/revoke`,
+      undefined,
+      sessionToken,
+    );
+  }
+
+  /** The wallet's compute credit, read with a compute API key or a compute session token. */
+  async computeBalance(auth: string): Promise<ComputeBalance> {
+    const r = (await this.sendJson("GET", "/v1/compute/balance", undefined, auth)) as Record<
+      string,
+      unknown
+    >;
+    const atomic = (k: string) => {
+      const v = r[k];
+      if (typeof v !== "string" || !/^[0-9]{1,30}$/.test(v))
+        throw new X402Error("http_error", `compute balance: bad ${k}`, false, { body: r });
+      return BigInt(v);
+    };
+    return {
+      address: String(r.address),
+      network: String(r.network),
+      balanceAtomic: atomic("balance_atomic"),
+      reservedAtomic: atomic("reserved_atomic"),
+      availableAtomic: atomic("available_atomic"),
+    };
+  }
+
+  /**
+   * Auto top-up within this client's spending policy: if the spendable compute credit is below
+   * `minAtomic`, buys compute.credit.* denominations (each an ordinary x402 purchase: per-call cap,
+   * budget, payee pin and origin all apply) until it reaches `topUpToAtomic`, at most
+   * `maxPurchases` purchases per call. The credit lands when each payment settles; invoke() returns
+   * only after settlement, so the balance read afterwards includes it. Only the wallet's own signer
+   * can do this: the server never pulls funds.
+   */
+  async ensureComputeCredit(opts: {
+    /** A compute API key or session token of THIS wallet (to read the balance). */
+    auth: string;
+    minAtomic: bigint;
+    topUpToAtomic: bigint;
+    maxPurchases?: number;
+  }): Promise<{ before: ComputeBalance; after: ComputeBalance; purchases: Purchase<unknown>[] }> {
+    if (opts.minAtomic < 0n || opts.topUpToAtomic < opts.minAtomic)
+      throw new X402Error("invalid_input", "need 0 <= minAtomic <= topUpToAtomic");
+    const before = await this.computeBalance(opts.auth);
+    if (before.network !== this.policy.network)
+      throw new X402Error(
+        "policy_rejected",
+        `compute credit is on ${before.network}; this client pays on ${this.policy.network}`,
+      );
+    if (before.address.toLowerCase() !== this.signer.address.toLowerCase())
+      throw new X402Error(
+        "policy_rejected",
+        "the compute key/session belongs to another wallet than this client's signer",
+      );
+    const purchases: Purchase<unknown>[] = [];
+    if (before.availableAtomic >= opts.minAtomic) return { before, after: before, purchases };
+    // Denominations on sale on our network, within the per-call cap, cheapest first.
+    const denominations = (await this.listServices())
+      .filter(
+        (s) =>
+          s.id.startsWith("compute.credit.") &&
+          s.purchasable &&
+          s.payment?.network === this.policy.network &&
+          /^[1-9][0-9]{0,14}$/.test(s.payment.amountAtomic) &&
+          BigInt(s.payment.amountAtomic) <= this.policy.maxPerCallAtomic,
+      )
+      .map((s) => ({ id: s.id, amount: BigInt(s.payment?.amountAtomic ?? "0") }))
+      .sort((a, b) => (a.amount < b.amount ? -1 : a.amount > b.amount ? 1 : 0));
+    if (!denominations.length)
+      throw new X402Error(
+        "not_purchasable",
+        "no compute credit is on sale within this client's per-call cap",
+      );
+    let have = before.availableAtomic;
+    const max = opts.maxPurchases ?? 5;
+    while (have < opts.topUpToAtomic && purchases.length < max) {
+      const need = opts.topUpToAtomic - have;
+      const pick =
+        denominations.find((d) => d.amount >= need) ??
+        (denominations[denominations.length - 1] as { id: string; amount: bigint });
+      const p = await this.invoke(
+        pick.id,
+        { network: this.policy.network },
+        { maxAmountAtomic: pick.amount },
+      );
+      purchases.push(p);
+      have += pick.amount;
+    }
+    const after = await this.computeBalance(opts.auth);
+    return { before, after, purchases };
   }
 
   /** An operator session (delivering as a listed registry agent) from a signed operatorMessage. */
@@ -772,6 +942,7 @@ export class TollyX402Client {
       transaction: settle ? decodePaymentResponseHeader(settle).transaction : null,
       amountAtomic,
       paymentId,
+      authorizationNonce: paymentNonce(res),
     };
   }
 
@@ -798,6 +969,7 @@ export class TollyX402Client {
           transaction: settlement?.transaction ?? null,
           amountAtomic,
           paymentId,
+          authorizationNonce: paymentNonce(res),
         };
       }
       if (res.status !== 202) {
@@ -917,6 +1089,12 @@ function randomNonce(): `0x${string}` {
   const bytes = new Uint8Array(32);
   globalThis.crypto.getRandomValues(bytes);
   return `0x${Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")}`;
+}
+
+/** The recorded authorization's nonce (X-Payment-Nonce), when the gateway states it. */
+function paymentNonce(res: Response): string | null {
+  const n = res.headers.get("X-Payment-Nonce");
+  return n && /^0x[0-9a-fA-F]{64}$/.test(n) ? n.toLowerCase() : null;
 }
 
 async function safeJson(res: Response): Promise<unknown> {
