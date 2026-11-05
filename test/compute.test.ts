@@ -54,6 +54,12 @@ let credited = 0n;
 let dir = "";
 /** false: the mock gateway answers like one with compute off (503 compute_unavailable). */
 let computeOn = true;
+/** The wallet the compute key answers as (another wallet's key cannot be topped up here). */
+let keyOwner = "";
+/** A purchase that settles but never shows up as credit (a gateway or wallet mix-up). */
+let creditStuck = false;
+/** What one OpenAI-format call needs in credit (atomic). */
+const CALL_COST = 500_000n;
 
 beforeAll(async () => {
   http = createHttp((req, res) => {
@@ -78,7 +84,13 @@ beforeAll(async () => {
       if (!computeOn && url.pathname.startsWith("/v1/compute/"))
         return json(503, { error: "compute_unavailable", reason: "not enabled" });
       if (url.pathname === "/v1/compute/models")
-        return json(200, { network: NET, models: [{ id: "claude-x", provider: "anthropic" }] });
+        return json(200, {
+          network: NET,
+          models: [
+            { id: "claude-haiku-5-5", provider: "anthropic", formats: ["anthropic"] },
+            { id: "claude-sonnet-5-5", formats: ["openai"] },
+          ],
+        });
       if (url.pathname === "/v1/services") return json(200, { services: [credit(1), credit(5)] });
       const one = /^\/v1\/services\/compute\.credit\.(\d+)usd\.v1$/.exec(url.pathname);
       if (one) return json(200, credit(Number(one[1])));
@@ -97,6 +109,11 @@ beforeAll(async () => {
         return json(200, { token: "compute-session", expires_at: "2099-01-01T00:00:00Z" });
       }
       if (url.pathname === "/v1/compute/balance") {
+        if (req.headers.authorization === `Bearer ${COMPUTE_KEY}`)
+          return json(200, {
+            address: keyOwner || me.address.toLowerCase(),
+            available_atomic: credited.toString(),
+          });
         if (req.headers.authorization !== "Bearer compute-session") return json(401, {});
         return json(200, {
           address: me.address.toLowerCase(),
@@ -124,6 +141,36 @@ beforeAll(async () => {
           }),
         );
       }
+      if (url.pathname === "/v1/compute/chat/completions") {
+        if (credited < CALL_COST)
+          return json(402, {
+            error: {
+              message: "not enough compute credit",
+              type: "insufficient_credit",
+              code: "insufficient_credit",
+              required_atomic: CALL_COST.toString(),
+            },
+          });
+        credited -= 1_000n;
+        return json(
+          200,
+          {
+            model: "claude-sonnet-5-5",
+            choices: [
+              {
+                index: 0,
+                message: { role: "assistant", content: "from the model" },
+                finish_reason: "stop",
+              },
+            ],
+            usage: { prompt_tokens: 9, completion_tokens: 3 },
+          },
+          {
+            "x-compute-cost-atomic": "1000",
+            "x-compute-request-id": "22222222-2222-2222-2222-222222222222",
+          },
+        );
+      }
       const m = /^\/v1\/services\/(compute\.credit\.(\d+)usd\.v1)\/invoke$/.exec(url.pathname);
       if (!m) return json(404, { error: "not_found" });
       const amount = String(Number(m[2]) * 1_000_000);
@@ -145,7 +192,7 @@ beforeAll(async () => {
         };
         return json(402, required, { "PAYMENT-REQUIRED": encodePaymentRequiredHeader(required) });
       }
-      credited += BigInt(amount);
+      if (!creditStuck) credited += BigInt(amount);
       res.writeHead(200, {
         "content-type": "application/json",
         "X-Job-Id": `00000000-0000-0000-0000-${String(seen.length).padStart(12, "0")}`,
@@ -166,6 +213,8 @@ afterAll(() => new Promise<void>((r) => http.close(() => r())));
 beforeEach(() => {
   seen = [];
   credited = 0n;
+  keyOwner = "";
+  creditStuck = false;
   dir = mkdtempSync(join(tmpdir(), "mcp-compute-"));
 });
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
@@ -283,5 +332,157 @@ describe("Tolly Compute MCP tools", () => {
       messages: [{ role: "user", content: "hello" }],
     });
     expect(seen.every((s) => !s.paid)).toBe(true);
+  });
+
+  it("calls a model in its own format: OpenAI where that is all it is served in, with the system prompt first", async () => {
+    credited = 2_000_000n;
+    const { call } = await connect({ TOLLY_COMPUTE_API_KEY: COMPUTE_KEY });
+    const r = await call("tolly_compute_chat", {
+      model: "claude-sonnet-5-5",
+      system: "be brief",
+      maxTokens: 40,
+      messages: [{ role: "user", content: "hello" }],
+    });
+    expect(r.isError).toBe(false);
+    expect(r.json).toMatchObject({
+      text: "from the model",
+      stop_reason: "stop",
+      charged_usdc: "0.001000",
+    });
+    const sent = seen.find((s) => s.path === "/v1/compute/chat/completions");
+    expect(JSON.parse(sent?.body ?? "{}")).toEqual({
+      model: "claude-sonnet-5-5",
+      max_completion_tokens: 40,
+      messages: [
+        { role: "system", content: "be brief" },
+        { role: "user", content: "hello" },
+      ],
+    });
+    const unknown = await call("tolly_compute_chat", {
+      model: "not-served",
+      maxTokens: 5,
+      messages: [{ role: "user", content: "x" }],
+    });
+    expect(unknown.json.error).toBe("unknown_model");
+  });
+
+  it("out of credit without auto top-up: a free error that says how to fix it", async () => {
+    const { call } = await connect({ TOLLY_COMPUTE_API_KEY: COMPUTE_KEY });
+    const r = await call("tolly_compute_chat", {
+      model: "claude-sonnet-5-5",
+      maxTokens: 40,
+      messages: [{ role: "user", content: "hello" }],
+    });
+    expect(r.isError).toBe(true);
+    expect(r.json).toMatchObject({ status: 402, charged_usdc: "0.000000" });
+    expect(String(r.json.error)).toMatch(/insufficient.credit/);
+    expect(String(r.json.hint)).toMatch(/TOLLY_COMPUTE_AUTO_TOPUP/);
+    expect(seen.some((s) => s.paid)).toBe(false);
+  });
+
+  it("with auto top-up the agent buys credit itself, within its caps, and the call goes through", async () => {
+    const { call } = await connect({
+      TOLLY_COMPUTE_API_KEY: COMPUTE_KEY,
+      TOLLY_COMPUTE_AUTO_TOPUP: "1:2",
+    });
+    const r = await call("tolly_compute_chat", {
+      model: "claude-sonnet-5-5",
+      maxTokens: 40,
+      messages: [{ role: "user", content: "hello" }],
+    });
+    expect(r.isError).toBe(false);
+    expect(r.json.text).toBe("from the model");
+    expect(r.json.auto_top_up).toMatchObject({ status: "topped_up", available_usdc: "2.000000" });
+    // Only credit denominations were paid for, each within the $2 per-call cap.
+    expect(seen.filter((s) => s.paid).map((s) => s.path)).toEqual([
+      "/v1/services/compute.credit.1usd.v1/invoke",
+      "/v1/services/compute.credit.1usd.v1/invoke",
+    ]);
+    expect(seen.filter((s) => s.path === "/v1/compute/chat/completions")).toHaveLength(2);
+    // Enough credit now: the next call buys nothing.
+    const paidBefore = seen.filter((s) => s.paid).length;
+    const next = await call("tolly_compute_chat", {
+      model: "claude-sonnet-5-5",
+      maxTokens: 40,
+      messages: [{ role: "user", content: "again" }],
+    });
+    expect(next.json.auto_top_up).toBeUndefined();
+    expect(seen.filter((s) => s.paid)).toHaveLength(paidBefore);
+  });
+
+  it("auto top-up stops at the daily budget", async () => {
+    const { call } = await connect({
+      TOLLY_COMPUTE_API_KEY: COMPUTE_KEY,
+      TOLLY_COMPUTE_AUTO_TOPUP: "1:2",
+      TOLLY_X402_BUDGET: "0.50",
+    });
+    const r = await call("tolly_compute_chat", {
+      model: "claude-sonnet-5-5",
+      maxTokens: 40,
+      messages: [{ role: "user", content: "hello" }],
+    });
+    expect(r.isError).toBe(true);
+    expect(seen.some((s) => s.paid)).toBe(false);
+  });
+
+  it("never buys credit for a compute key of another wallet", async () => {
+    keyOwner = "0x00000000000000000000000000000000000000bb";
+    const { call } = await connect({
+      TOLLY_COMPUTE_API_KEY: COMPUTE_KEY,
+      TOLLY_COMPUTE_AUTO_TOPUP: "1:2",
+    });
+    const r = await call("tolly_compute_chat", {
+      model: "claude-sonnet-5-5",
+      maxTokens: 40,
+      messages: [{ role: "user", content: "hello" }],
+    });
+    expect(r.isError).toBe(true);
+    expect(r.json.auto_top_up).toMatchObject({ status: "not_topped_up" });
+    expect(seen.some((s) => s.paid)).toBe(false);
+  });
+
+  it("refuses a malformed TOLLY_COMPUTE_AUTO_TOPUP", async () => {
+    for (const v of ["5", "2:1", "x:y", "-1:2"])
+      await expect(
+        connect({ TOLLY_COMPUTE_API_KEY: COMPUTE_KEY, TOLLY_COMPUTE_AUTO_TOPUP: v }),
+      ).rejects.toThrow(/TOLLY_COMPUTE_AUTO_TOPUP/);
+  });
+
+  it("stops buying when a purchase does not raise the credit", async () => {
+    creditStuck = true;
+    const { call } = await connect({
+      TOLLY_COMPUTE_API_KEY: COMPUTE_KEY,
+      TOLLY_COMPUTE_AUTO_TOPUP: "1:2",
+    });
+    const ask = () =>
+      call("tolly_compute_chat", {
+        model: "claude-sonnet-5-5",
+        maxTokens: 40,
+        messages: [{ role: "user", content: "hello" }],
+      });
+    const first = await ask();
+    expect(first.isError).toBe(true);
+    const paidAfterFirst = seen.filter((s) => s.paid).length;
+    expect(paidAfterFirst).toBeGreaterThan(0);
+    const second = await ask();
+    expect(second.isError).toBe(true);
+    expect(second.json.auto_top_up).toMatchObject({ status: "not_topped_up" });
+    expect(seen.filter((s) => s.paid)).toHaveLength(paidAfterFirst);
+  });
+
+  it("parallel calls share one top-up instead of each buying", async () => {
+    const { call } = await connect({
+      TOLLY_COMPUTE_API_KEY: COMPUTE_KEY,
+      TOLLY_COMPUTE_AUTO_TOPUP: "1:2",
+    });
+    const ask = () =>
+      call("tolly_compute_chat", {
+        model: "claude-sonnet-5-5",
+        maxTokens: 40,
+        messages: [{ role: "user", content: "hello" }],
+      });
+    const [a, b, c] = await Promise.all([ask(), ask(), ask()]);
+    expect([a.isError, b.isError, c.isError]).toEqual([false, false, false]);
+    expect(seen.filter((s) => s.paid)).toHaveLength(2); // $1 + $1 up to the $2 target, once
   });
 });

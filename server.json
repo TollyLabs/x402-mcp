@@ -8,12 +8,12 @@
     "source": "github"
   },
   "websiteUrl": "https://agent.tollylabs.com/agentic-market/",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@tollylabs/x402-mcp",
-      "version": "0.6.0",
+      "version": "0.7.0",
       "transport": {
         "type": "stdio"
       },
@@ -105,9 +105,15 @@
         },
         {
           "name": "TOLLY_COMPUTE_API_KEY",
-          "description": "Optional: Tolly Compute API key (tck_...) for tolly_compute_chat. Compute tools appear once TOLLY enables compute.",
+          "description": "Optional: Tolly Compute API key (tck_...) for tolly_compute_chat (Claude, GPT/Codex, Gemini, Grok and more).",
           "isRequired": false,
           "isSecret": true,
+          "format": "string"
+        },
+        {
+          "name": "TOLLY_COMPUTE_AUTO_TOPUP",
+          "description": "Optional: <minUsd>:<topUpToUsd>, e.g. 1:5. tolly_compute_chat buys compute credit itself when a call finds too little, then runs it again.",
+          "isRequired": false,
           "format": "string"
         }
       ]

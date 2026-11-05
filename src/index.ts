@@ -34,6 +34,8 @@
 //   TOLLY_X402_TOOLS        optional: comma-separated service ids to offer (default: all)
 //   TOLLY_X402_LEDGER       default ~/.tolly-x402/spend.json
 //   TOLLY_COMPUTE_API_KEY   optional: a compute API key (tck_…) for tolly_compute_chat
+//   TOLLY_COMPUTE_AUTO_TOPUP optional: "<minUsd>:<topUpToUsd>", e.g. 1:5: tolly_compute_chat buys
+//                           credit by itself when a call finds too little (needs the buyer key)
 //
 // Tolly Compute (docs/os/COMPUTE.md): tolly_compute_balance (signed, free) reads this wallet's
 // prepaid inference credit; tolly_compute_topup (PAID) buys compute.credit.* denominations up to a
@@ -931,7 +933,7 @@ const COMPUTE_KEY_TOOLS: Tool[] = [
 const COMPUTE_CHAT_TOOL: Tool = {
   name: "tolly_compute_chat",
   description:
-    "Run one model call through Tolly Compute, paid from this wallet's prepaid compute credit with TOLLY_COMPUTE_API_KEY (the key's per-request and daily caps apply; nothing is signed or paid on chain). Anthropic Messages format, text only, non-streaming. Returns the model's text and what the call cost. Models and prices: GET /v1/compute/models.",
+    "Run one model call through Tolly Compute (Claude, GPT/Codex, Gemini, Grok, DeepSeek, Qwen and more), paid from this wallet's prepaid compute credit with TOLLY_COMPUTE_API_KEY (the key's per-request and daily caps apply). Text only, non-streaming; the model's own format is chosen for you. With TOLLY_COMPUTE_AUTO_TOPUP set, a call that finds too little credit buys more (PAID, within the per-call cap and daily budget) and runs again. Returns the model's text and what the call cost. Models and prices: GET /v1/compute/models.",
   inputSchema: {
     type: "object",
     required: ["model", "messages", "maxTokens"],
@@ -1449,6 +1451,63 @@ export async function createServer(
       : null;
   if (env.TOLLY_COMPUTE_API_KEY && !computeKey)
     throw new Error("TOLLY_COMPUTE_API_KEY is not a compute API key (tck_…)");
+  // Automatic top-up for tolly_compute_chat: "<minUsd>:<topUpToUsd>". When a call finds too
+  // little credit, the tool buys more (each purchase within the per-call cap and daily budget)
+  // and runs the call again, so an agent keeps working without a human.
+  const autoTopUp = (() => {
+    const raw = env.TOLLY_COMPUTE_AUTO_TOPUP?.trim();
+    if (!raw) return null;
+    const m = /^([0-9]{1,4}(?:\.[0-9]{1,6})?):([0-9]{1,4}(?:\.[0-9]{1,6})?)$/.exec(raw);
+    const min = m ? toAtomic(m[1] as string) : 0n;
+    const to = m ? toAtomic(m[2] as string) : 0n;
+    if (!m || to <= 0n || min > to || to > 1_000_000_000n)
+      throw new Error("TOLLY_COMPUTE_AUTO_TOPUP must be <minUsd>:<topUpToUsd>, e.g. 1:5");
+    return { min, to };
+  })();
+  // The one automatic top-up running now, and why automatic top-up stopped (if it did).
+  let autoTopUpRun: Promise<
+    { ok: true; summary: Record<string, unknown> } | { ok: false; reply: ReturnType<typeof text> }
+  > | null = null;
+  let autoTopUpOff: string | null = null;
+  // The formats each served model speaks (GET /v1/compute/models), cached for a minute.
+  let formatCache: { at: number; byModel: Map<string, string[]> } | null = null;
+  const computeFormats = async (model: string): Promise<string[]> => {
+    if (!formatCache || Date.now() - formatCache.at > 60_000) {
+      const r = await getJson(`${base}/v1/compute/models`);
+      let list: unknown = null;
+      try {
+        list = r.ok ? ((JSON.parse(r.body) as { models?: unknown }).models ?? null) : null;
+      } catch {
+        list = null;
+      }
+      // A failed read is not cached: the next call asks again.
+      if (!Array.isArray(list)) return [];
+      const byModel = new Map<string, string[]>();
+      if (Array.isArray(list))
+        for (const m of list as { id?: unknown; formats?: unknown }[])
+          if (typeof m?.id === "string" && Array.isArray(m.formats))
+            byModel.set(
+              m.id,
+              m.formats.filter((f): f is string => f === "anthropic" || f === "openai"),
+            );
+      formatCache = { at: Date.now(), byModel };
+    }
+    return formatCache.byModel.get(model) ?? [];
+  };
+  /** The wallet TOLLY_COMPUTE_API_KEY belongs to (lower case), or null. */
+  const computeKeyOwner = async (): Promise<string | null> => {
+    if (!computeKey) return null;
+    const r = await getJson(`${base}/v1/compute/balance`, {
+      headers: { authorization: `Bearer ${computeKey}` },
+    });
+    let a: unknown = null;
+    try {
+      a = r.ok ? (JSON.parse(r.body) as { address?: unknown }).address : null;
+    } catch {
+      a = null;
+    }
+    return typeof a === "string" && /^0x[0-9a-fA-F]{40}$/.test(a) ? a.toLowerCase() : null;
+  };
   // A compute session (1 h), signed with the buyer key on first use.
   let computeSessionCache: { token: string; until: number } | null = null;
   const computeSession = async (): Promise<string> => {
@@ -2117,73 +2176,6 @@ export async function createServer(
           top_up: "tolly_compute_topup buys more (paid).",
         });
       }
-      if (name === "tolly_compute_chat") {
-        if (!computeKey) return text("tolly_compute_chat needs TOLLY_COMPUTE_API_KEY", true);
-        const model = String(args.model ?? "");
-        const maxTokens = Number(args.maxTokens);
-        const messages = Array.isArray(args.messages) ? args.messages : [];
-        if (!model || !Number.isSafeInteger(maxTokens) || maxTokens < 1 || !messages.length)
-          return text("model, messages and maxTokens are required", true);
-        const body = {
-          model,
-          max_tokens: maxTokens,
-          ...(typeof args.system === "string" ? { system: args.system } : {}),
-          messages: messages.map((m) => {
-            const x = (m ?? {}) as Record<string, unknown>;
-            return {
-              role: x.role === "assistant" ? "assistant" : "user",
-              content: String(x.content ?? ""),
-            };
-          }),
-        };
-        const ctrl = new AbortController();
-        const t = setTimeout(() => ctrl.abort(), 180_000);
-        try {
-          const res = await fetch(`${base}/v1/compute/messages`, {
-            method: "POST",
-            redirect: "error",
-            signal: ctrl.signal,
-            headers: { "content-type": "application/json", authorization: `Bearer ${computeKey}` },
-            body: JSON.stringify(body),
-          });
-          const raw = (await res.text()).slice(0, MAX_BODY);
-          const cost = res.headers.get("x-compute-cost-atomic");
-          const costUsd = cost && /^[0-9]{1,30}$/.test(cost) ? fmt(cost) : null;
-          let json: Record<string, unknown> | null = null;
-          try {
-            json = JSON.parse(raw) as Record<string, unknown>;
-          } catch {
-            json = null;
-          }
-          if (!res.ok) {
-            const err = (json?.error ?? {}) as Record<string, unknown>;
-            return text(
-              {
-                error: clean(err.type ?? `HTTP ${res.status}`, 60),
-                message: clean(err.message ?? raw, 400),
-                status: res.status,
-                charged_usdc: costUsd ?? "0.000000",
-              },
-              true,
-            );
-          }
-          const content = Array.isArray(json?.content) ? json.content : [];
-          const out = content
-            .filter((c) => (c as { type?: unknown })?.type === "text")
-            .map((c) => String((c as { text?: unknown }).text ?? ""))
-            .join("\n");
-          return text({
-            model: clean(json?.model, 100),
-            stop_reason: clean(json?.stop_reason, 40),
-            text: scrub(out),
-            usage: scrub(json?.usage ?? null),
-            charged_usdc: costUsd,
-            request_id: clean(res.headers.get("x-compute-request-id"), 40),
-          });
-        } finally {
-          clearTimeout(t);
-        }
-      }
       if (ACP_TOOL_NAMES.has(name)) {
         if (!acp) return text(`Tolly ACP tools are off: ${acpOff}`, true);
         return await callAcpTool(
@@ -2431,6 +2423,104 @@ export async function createServer(
           throw err;
         }
       };
+      /**
+       * Buys compute credit until the spendable credit reaches `target`, when it is below `floor`:
+       * compute.credit.* denominations, each an ordinary paid purchase inside the per-call cap and
+       * the daily budget, at most 5. Shared by tolly_compute_topup and the automatic top-up of
+       * tolly_compute_chat (TOLLY_COMPUTE_AUTO_TOPUP).
+       */
+      const computeTopUp = async (
+        floor: bigint,
+        target: bigint,
+      ): Promise<
+        | { ok: true; summary: Record<string, unknown> }
+        | { ok: false; reply: ReturnType<typeof text> }
+      > => {
+        if (!client || !account || !network) return { ok: false, reply: text(noClient(), true) };
+        const before = await computeBalance();
+        let have = BigInt(before.available_atomic);
+        if (have >= floor)
+          return {
+            ok: true,
+            summary: { status: "enough_credit", available_usdc: fmt(have), charged: false },
+          };
+        // The denominations on sale on our network within the per-call cap, cheapest first.
+        const denominations = services
+          .filter(
+            (sv) =>
+              sv.id.startsWith("compute.credit.") &&
+              sv.purchasable &&
+              sv.payment?.network === network &&
+              ATOMIC.test(sv.payment.amountAtomic),
+          )
+          .map((sv) => ({ id: sv.id, amount: BigInt(sv.payment?.amountAtomic ?? "0") }))
+          .filter((d) => d.amount > 0n && d.amount <= maxPerCall)
+          .sort((a, b) => (a.amount < b.amount ? -1 : a.amount > b.amount ? 1 : 0));
+        if (!denominations.length)
+          return {
+            ok: false,
+            reply: text(
+              {
+                error: "not_purchasable",
+                message: `No compute credit is on sale within your per-call cap of ${fmt(maxPerCall)} USDC.`,
+                charged: false,
+              },
+              true,
+            ),
+          };
+        const bought: {
+          service: string;
+          paid_usdc: string;
+          transaction: string | null;
+          jobId: string;
+          jobToken: string;
+        }[] = [];
+        while (have < target && bought.length < 5) {
+          const need = target - have;
+          const pick =
+            denominations.find((d) => d.amount >= need) ??
+            (denominations[denominations.length - 1] as { id: string; amount: bigint });
+          try {
+            // Paid by this key, never the agent's account: compute credit belongs to the wallet
+            // that pays, and the balance, sessions and compute key here are this key's.
+            const done = await paidCall(
+              client,
+              pick.amount,
+              () => client.invoke(pick.id, { network }, { maxAmountAtomic: pick.amount }),
+              true,
+            );
+            if (!("ok" in done)) {
+              if (!bought.length) return { ok: false, reply: overBudget(pick.amount) };
+              break;
+            }
+            bought.push({
+              service: pick.id,
+              paid_usdc: fmt(done.ok.amountAtomic),
+              transaction: done.ok.transaction,
+              jobId: done.ok.jobId,
+              jobToken: done.ok.jobToken,
+            });
+            have += pick.amount;
+          } catch (err) {
+            if (!(err instanceof X402Error)) throw err;
+            // A resume goes through the denomination's own paid tool (it takes the resume id).
+            const tool = paid.find((t) => t.service?.id === pick.id)?.name ?? "tolly_compute_topup";
+            if (!bought.length) return { ok: false, reply: failure(err, tool) };
+            break;
+          }
+        }
+        const after = await computeBalance();
+        return {
+          ok: true,
+          summary: {
+            status: BigInt(after.available_atomic) >= target ? "topped_up" : "partly_topped_up",
+            available_before_usdc: fmt(before.available_atomic),
+            available_usdc: fmt(after.available_atomic),
+            purchases: bought,
+            ...settle(),
+          },
+        };
+      };
       if (name === "tolly_compute_topup") {
         if (!client || !account || !network) return text(noClient(), true);
         const to = Number(args.topUpToUsd);
@@ -2447,76 +2537,152 @@ export async function createServer(
             "topUpToUsd must be a positive number of USDC (at most 1000) and minUsd between 0 and it",
             true,
           );
-        const target = toAtomic(to.toFixed(6));
-        const floor = toAtomic(min.toFixed(6));
-        const before = await computeBalance();
-        let have = BigInt(before.available_atomic);
-        if (have >= floor)
-          return text({ status: "enough_credit", available_usdc: fmt(have), charged: false });
-        // The denominations on sale on our network within the per-call cap, cheapest first.
-        const denominations = services
-          .filter(
-            (sv) =>
-              sv.id.startsWith("compute.credit.") &&
-              sv.purchasable &&
-              sv.payment?.network === network &&
-              ATOMIC.test(sv.payment.amountAtomic),
-          )
-          .map((sv) => ({ id: sv.id, amount: BigInt(sv.payment?.amountAtomic ?? "0") }))
-          .filter((d) => d.amount > 0n && d.amount <= maxPerCall)
-          .sort((a, b) => (a.amount < b.amount ? -1 : a.amount > b.amount ? 1 : 0));
-        if (!denominations.length)
+        const r = await computeTopUp(toAtomic(min.toFixed(6)), toAtomic(to.toFixed(6)));
+        return r.ok ? text(r.summary) : r.reply;
+      }
+      if (name === "tolly_compute_chat") {
+        if (!computeKey) return text("tolly_compute_chat needs TOLLY_COMPUTE_API_KEY", true);
+        const model = String(args.model ?? "");
+        const maxTokens = Number(args.maxTokens);
+        const messages = Array.isArray(args.messages) ? args.messages : [];
+        if (!model || !Number.isSafeInteger(maxTokens) || maxTokens < 1 || !messages.length)
+          return text("model, messages and maxTokens are required", true);
+        const turns = messages.map((m) => {
+          const x = (m ?? {}) as Record<string, unknown>;
+          return {
+            role: x.role === "assistant" ? "assistant" : "user",
+            content: String(x.content ?? ""),
+          };
+        });
+        const system = typeof args.system === "string" ? args.system : undefined;
+        // The model's own wire format: Anthropic Messages when it speaks it, else OpenAI Chat
+        // Completions (some models, Claude ones included, are served in the latter only).
+        const formats = await computeFormats(model);
+        if (!formats.length)
           return text(
             {
-              error: "not_purchasable",
-              message: `No compute credit is on sale within your per-call cap of ${fmt(maxPerCall)} USDC.`,
-              charged: false,
+              error: "unknown_model",
+              message: `${model} is not served (see GET /v1/compute/models)`,
             },
             true,
           );
-        const bought: {
-          service: string;
-          paid_usdc: string;
-          transaction: string | null;
-          jobId: string;
-          jobToken: string;
-        }[] = [];
-        while (have < target && bought.length < 5) {
-          const need = target - have;
-          const pick =
-            denominations.find((d) => d.amount >= need) ??
-            (denominations[denominations.length - 1] as { id: string; amount: bigint });
+        const anthropic = formats.includes("anthropic");
+        const path = anthropic ? "/v1/compute/messages" : "/v1/compute/chat/completions";
+        const body = anthropic
+          ? { model, max_tokens: maxTokens, ...(system ? { system } : {}), messages: turns }
+          : {
+              model,
+              max_completion_tokens: maxTokens,
+              messages: [...(system ? [{ role: "system", content: system }] : []), ...turns],
+            };
+        const send = async () => {
+          const ctrl = new AbortController();
+          const t = setTimeout(() => ctrl.abort(), 180_000);
           try {
-            const done = await paidCall(client, pick.amount, () =>
-              client.invoke(pick.id, { network }, { maxAmountAtomic: pick.amount }),
-            );
-            if (!("ok" in done)) {
-              if (!bought.length) return overBudget(pick.amount);
-              break;
-            }
-            bought.push({
-              service: pick.id,
-              paid_usdc: fmt(done.ok.amountAtomic),
-              transaction: done.ok.transaction,
-              jobId: done.ok.jobId,
-              jobToken: done.ok.jobToken,
+            const res = await fetch(`${base}${path}`, {
+              method: "POST",
+              redirect: "error",
+              signal: ctrl.signal,
+              headers: {
+                "content-type": "application/json",
+                authorization: `Bearer ${computeKey}`,
+              },
+              body: JSON.stringify(body),
             });
-            have += pick.amount;
-          } catch (err) {
-            if (!(err instanceof X402Error)) throw err;
-            // A resume goes through the denomination's own paid tool (it takes the resume id).
-            const tool = paid.find((t) => t.service?.id === pick.id)?.name ?? "tolly_compute_topup";
-            if (!bought.length) return failure(err, tool);
-            break;
+            const raw = (await res.text()).slice(0, MAX_BODY);
+            let json: Record<string, unknown> | null = null;
+            try {
+              json = JSON.parse(raw) as Record<string, unknown>;
+            } catch {
+              json = null;
+            }
+            return { res, raw, json };
+          } finally {
+            clearTimeout(t);
+          }
+        };
+        let { res, raw, json } = await send();
+        let topUp: Record<string, unknown> | null = null;
+        const errOf = (j: Record<string, unknown> | null) =>
+          (j?.error ?? {}) as Record<string, unknown>;
+        // Out of credit: with TOLLY_COMPUTE_AUTO_TOPUP the agent pays for more itself (inside its
+        // per-call cap and daily budget) and the call runs again, once.
+        if (res.status === 402 && errOf(json).type === "insufficient_credit" && autoTopUp) {
+          const required = String(errOf(json).required_atomic ?? "0");
+          const need = ATOMIC.test(required) ? BigInt(required) : 0n;
+          const owner = await computeKeyOwner();
+          if (!owner || !account || owner !== account.address.toLowerCase())
+            topUp = {
+              status: "not_topped_up",
+              reason:
+                "TOLLY_COMPUTE_API_KEY belongs to another wallet than BUYER_PRIVATE_KEY, so its credit cannot be bought here",
+            };
+          else if (autoTopUpOff) topUp = { status: "not_topped_up", reason: autoTopUpOff };
+          else {
+            const floor = need > autoTopUp.min ? need : autoTopUp.min;
+            const target = need > autoTopUp.to ? need : autoTopUp.to;
+            // One top-up at a time: parallel calls wait for it instead of each buying.
+            autoTopUpRun ??= computeTopUp(floor, target).finally(() => {
+              autoTopUpRun = null;
+            });
+            const r = await autoTopUpRun;
+            if (!r.ok) return r.reply;
+            topUp = r.summary;
+            const bought = Array.isArray(r.summary.purchases) ? r.summary.purchases.length : 0;
+            const before = String(r.summary.available_before_usdc ?? "");
+            const after = String(r.summary.available_usdc ?? "");
+            if (bought > 0 && before === after)
+              // Paid, yet the credit did not move: never keep buying blind.
+              autoTopUpOff =
+                "a purchase did not raise this key's credit; automatic top-up is off until restart";
+            ({ res, raw, json } = await send());
           }
         }
-        const after = await computeBalance();
+        const cost = res.headers.get("x-compute-cost-atomic");
+        const costUsd = cost && /^[0-9]{1,30}$/.test(cost) ? fmt(cost) : null;
+        if (!res.ok) {
+          const err = errOf(json);
+          return text(
+            {
+              error: clean(err.type ?? `HTTP ${res.status}`, 60),
+              message: clean(err.message ?? raw, 400),
+              status: res.status,
+              charged_usdc: costUsd ?? "0.000000",
+              ...(topUp ? { auto_top_up: topUp } : {}),
+              ...(res.status === 402 && !autoTopUp
+                ? {
+                    hint: "tolly_compute_topup buys more credit; TOLLY_COMPUTE_AUTO_TOPUP=<minUsd>:<topUpToUsd> makes this tool do it by itself",
+                  }
+                : {}),
+            },
+            true,
+          );
+        }
+        let out = "";
+        let stop: unknown = null;
+        if (anthropic) {
+          const content = Array.isArray(json?.content) ? json.content : [];
+          out = content
+            .filter((c) => (c as { type?: unknown })?.type === "text")
+            .map((c) => String((c as { text?: unknown }).text ?? ""))
+            .join("\n");
+          stop = json?.stop_reason;
+        } else {
+          const choice = (Array.isArray(json?.choices) ? json.choices[0] : null) as {
+            message?: { content?: unknown };
+            finish_reason?: unknown;
+          } | null;
+          out = typeof choice?.message?.content === "string" ? choice.message.content : "";
+          stop = choice?.finish_reason;
+        }
         return text({
-          status: BigInt(after.available_atomic) >= target ? "topped_up" : "partly_topped_up",
-          available_before_usdc: fmt(before.available_atomic),
-          available_usdc: fmt(after.available_atomic),
-          purchases: bought,
-          ...settle(),
+          model: clean(json?.model, 100),
+          stop_reason: clean(stop, 40),
+          text: scrub(out),
+          usage: scrub(json?.usage ?? null),
+          charged_usdc: costUsd,
+          request_id: clean(res.headers.get("x-compute-request-id"), 40),
+          ...(topUp ? { auto_top_up: topUp } : {}),
         });
       }
       if (name === "tolly_routed_buy") {

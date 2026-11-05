@@ -80,6 +80,7 @@ Claude Desktop / other MCP clients (`mcpServers` entry):
 | `TOLLY_SPEND_POLICY` | Optional: the AgentSpendPolicy address (a pin). With `TOLLY_AGENT_WALLET` and `TOLLY_RPC_URL`, and the owner's rules active for this key, x402 payments are made from the agent's wallet. See "Spending rules on chain" below. |
 | `TOLLY_SPEND_POLICY_CODEHASH` | Optional: keccak256 of the policy's runtime code, checked over your RPC before the first transaction. |
 | `TOLLY_COMPUTE_API_KEY` | Optional: a Tolly Compute API key (`tck_…`); offers `tolly_compute_chat`. |
+| `TOLLY_COMPUTE_AUTO_TOPUP` | Optional: `<minUsd>:<topUpToUsd>`, e.g. `1:5`. `tolly_compute_chat` buys compute credit by itself when a call finds too little, then runs it again (needs `BUYER_PRIVATE_KEY`). |
 
 ### What is live on TOLLY
 
@@ -88,11 +89,11 @@ Claude Desktop / other MCP clients (`mcpServers` entry):
   `0x75db32f542f981ca4E545A5B35379e3735104a65` (as `GET /v1/acp` publishes it). Set it as
   `TOLLY_ACP_ADDRESS` to pin it; the wallet tools need the pin.
 - The allowance float (`TOLLY_AGENT_WALLET`) runs entirely in this server against your RPC.
-- Spending rules on chain (AgentSpendPolicy), Tolly Compute and agent inboxes: in this server, but
-  not yet enabled on TOLLY. The policy tools appear only with `TOLLY_SPEND_POLICY` set; the inbox
-  and compute credit tools appear once TOLLY enables those features (the server checks
-  `GET /v1/inbox` and `GET /v1/compute/models` at start); the chat tool needs
-  `TOLLY_COMPUTE_API_KEY`.
+- Tolly Compute (prepaid model inference: Claude, GPT/Codex, Gemini, Grok, DeepSeek, Qwen and
+  more) and agent inboxes: live. The compute credit tools appear once `GET /v1/compute/models`
+  answers with a model; the chat tool needs `TOLLY_COMPUTE_API_KEY`.
+- Spending rules on chain (AgentSpendPolicy): in this server, not yet enabled on TOLLY. Its tools
+  appear only with `TOLLY_SPEND_POLICY` set.
 
 ## Tools
 
@@ -294,10 +295,10 @@ invisible characters and capped at 40,000 characters: email is prompt-injection 
 
 ## Tolly Compute (prepaid model inference)
 
-Prepaid credit for model inference, bought with x402. Not yet enabled on TOLLY:
-`tolly_compute_balance` and `tolly_compute_topup` appear once it is (`GET /v1/compute/models`
-answers with at least one model; until then it answers 503 `compute_unavailable` and they stay
-hidden), and `tolly_compute_chat` is listed only with `TOLLY_COMPUTE_API_KEY` set.
+Prepaid credit for model inference, bought with x402. `tolly_compute_balance` and
+`tolly_compute_topup` appear when TOLLY serves compute (`GET /v1/compute/models` answers with at
+least one model; otherwise it answers 503 `compute_unavailable` and they stay hidden), and
+`tolly_compute_chat` is listed only with `TOLLY_COMPUTE_API_KEY` set.
 
 - `tolly_compute_balance` (signed, free) shows this wallet's credit: balance, held, spendable and
   recent ledger entries. It signs a compute sign-in message with the buyer key, which cannot move
@@ -310,10 +311,18 @@ hidden), and `tolly_compute_chat` is listed only with `TOLLY_COMPUTE_API_KEY` se
   - Credit lands when each payment settles.
 - `tolly_compute_chat` (offered only with `TOLLY_COMPUTE_API_KEY=tck_…`):
   `{ model, messages, maxTokens, system? }`.
-  - One Anthropic-format call, paid from the credit by that key. The key's per-request and daily
-    caps are enforced by TOLLY.
+  - One model call (Claude, GPT/Codex, Gemini, Grok, DeepSeek, Qwen, private uncensored models
+    and more: `GET /v1/compute/models`), paid from the credit by that key, in the model's own
+    format (chosen for you). The key's per-request and daily caps are enforced by TOLLY.
   - Returns the text and the charge.
   - Create keys with a signed compute session (`POST /v1/compute/keys`).
+- **Automatic top-up:** set `TOLLY_COMPUTE_AUTO_TOPUP=<minUsd>:<topUpToUsd>` (e.g. `1:5`) beside
+  `BUYER_PRIVATE_KEY` and `TOLLY_COMPUTE_API_KEY`. When `tolly_compute_chat` finds too little
+  credit, it buys more from this wallet (each purchase within `TOLLY_X402_MAX_PER_CALL` and the
+  daily budget) and runs the call again, once, so an agent keeps working without a human.
+  - Credit is bought by the buyer key itself, and only for a compute key of that same wallet.
+  - Parallel calls share one top-up. If a purchase does not raise the credit, automatic top-up
+    turns itself off until restart.
 
 ## Build from source
 
